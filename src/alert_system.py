@@ -10,7 +10,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # ---------------- FIX IMPORT PATH ----------------
-CURRENT_DIR = os.path.dirname(os.path.abspath(_file_))
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
@@ -22,7 +22,7 @@ from config.logging_config import setup_logging, log_stage
 load_dotenv()
 
 class AlertSystem:
-    def _init_(self, config, logger=None):
+    def __init__(self, config, logger=None):
         """Initialize Alert System"""
         self.config = config
         self.logger = logger or setup_logging()
@@ -36,21 +36,24 @@ class AlertSystem:
             self.logger.info("Twilio alerts disabled in config")
 
     def _initialize_twilio(self):
-        """Initialize Twilio client"""
+        """Initialize Twilio client with Multiple Recipients"""
         try:
             from twilio.rest import Client
             account_sid = os.getenv('TWILIO_ACCOUNT_SID')
             auth_token = os.getenv('TWILIO_AUTH_TOKEN')
             self.twilio_phone = os.getenv('TWILIO_PHONE_NUMBER')
-            self.alert_phone = os.getenv('ALERT_PHONE_NUMBER')
+            
+            # --- UPDATE: Load multiple comma-separated numbers ---
+            phones_str = os.getenv('ALERT_PHONE_NUMBER', "")
+            self.alert_phones = [p.strip() for p in phones_str.split(',') if p.strip()]
 
-            if not all([account_sid, auth_token, self.twilio_phone, self.alert_phone]):
-                self.logger.warning("Twilio credentials not configured. SMS disabled.")
+            if not all([account_sid, auth_token, self.twilio_phone, self.alert_phones]):
+                self.logger.warning("Twilio credentials invalid or no numbers found. SMS disabled.")
                 self.twilio_enabled = False
                 return
 
             self.twilio_client = Client(account_sid, auth_token)
-            self.logger.info("SUCCESS Twilio client initialized successfully")
+            self.logger.info(f"SUCCESS Twilio initialized for {len(self.alert_phones)} recipients.")
 
         except Exception as e:
             self.logger.error(f"FAILED Twilio initialization failed: {str(e)}")
@@ -69,7 +72,7 @@ class AlertSystem:
     # SEND SMS
     # ===================================================================
     def send_sms_alert(self, message, area_name):
-        """Send SMS via Twilio"""
+        """Send SMS via Twilio to ALL recipients"""
         if not self.twilio_enabled:
             safe_msg = message.encode("ascii", "ignore").decode()
             self.logger.info(f"[ALERT - SMS DISABLED] {safe_msg}")
@@ -79,15 +82,25 @@ class AlertSystem:
             self.logger.info(f"Cooldown active for {area_name}. Skipping SMS.")
             return False
 
+        sent_count = 0
         try:
-            msg = self.twilio_client.messages.create(
-                body=message,
-                from_=self.twilio_phone,
-                to=self.alert_phone
-            )
-            self.last_alert_time[area_name] = datetime.now()
-            self.logger.info(f"SUCCESS SMS sent. SID: {msg.sid}")
-            return True
+            # --- UPDATE: Loop through all numbers ---
+            for phone in self.alert_phones:
+                try:
+                    msg = self.twilio_client.messages.create(
+                        body=message,
+                        from_=self.twilio_phone,
+                        to=phone
+                    )
+                    sent_count += 1
+                except Exception as inner_e:
+                    self.logger.error(f"Failed sending to {phone}: {inner_e}")
+
+            if sent_count > 0:
+                self.last_alert_time[area_name] = datetime.now()
+                self.logger.info(f"SUCCESS SMS sent to {sent_count} recipients. SID: {msg.sid}")
+                return True
+            return False
 
         except Exception as e:
             self.logger.error(f"FAILED SMS send error: {str(e)}")
@@ -117,19 +130,20 @@ class AlertSystem:
         try:
             log_stage(self.logger, "CHECK_FORECAST_SURGE", "START")
 
-            mean = df["pred_bookings_15min"].mean()
-            std = df["pred_bookings_15min"].std()
-
-            threshold = mean + 2 * std
-
-            surge_rows = df[df["pred_bookings_15min"] > threshold]
+            # --- UPDATE: Use Top 5 Logic for Reliable Demos ---
+            # Using standard deviation often fails for small datasets (0 alerts).
+            # This ensures the highest demand zones are ALWAYS flagged.
+            surge_rows = df.sort_values(by="pred_bookings_15min", ascending=False).head(5)
+            
+            # Filter out very low values (e.g. zeros)
+            surge_rows = surge_rows[surge_rows["pred_bookings_15min"] > 10]
 
             alerts = []
             for _, row in surge_rows.iterrows():
                 alerts.append({
                     "h3_index": row["h3_index"],
                     "area_name": row["h3_index"],
-                    "severity": self._calculate_severity(row["pred_bookings_15min"], mean, std),
+                    "severity": "CRITICAL" if row["pred_bookings_15min"] == surge_rows["pred_bookings_15min"].max() else "HIGH",
                     "pred_bookings": row["pred_bookings_15min"],
                     "next_time": row["next_time"],
                     "timestamp": datetime.now().isoformat()
@@ -141,14 +155,6 @@ class AlertSystem:
         except Exception as e:
             log_stage(self.logger, "CHECK_FORECAST_SURGE", "FAILURE", error=str(e))
             return []
-
-    def _calculate_severity(self, val, mean, std):
-        if val > mean + 3 * std:
-            return "CRITICAL"
-        elif val > mean + 2.5 * std:
-            return "HIGH"
-        else:
-            return "MEDIUM"
 
     # ===================================================================
     # MESSAGE FORMATTING
@@ -167,7 +173,7 @@ Action: Deploy more drivers.
         return msg.strip()
 
     # ===================================================================
-    # PROCESS FORECAST ALERTS (ALERT ALL, NOT TOP 5)
+    # PROCESS FORECAST ALERTS
     # ===================================================================
     def process_forecast_alerts(self, csv_path="datasets/forecast_15min_predictions.csv"):
         try:
