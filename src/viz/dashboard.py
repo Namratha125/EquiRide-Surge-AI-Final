@@ -18,7 +18,7 @@ CSS_PATH = Path(__file__).resolve().parent / "styles.css"
 
 # --- 2. CREDENTIALS ---
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "ACd16431c489770b29a82b76faa8e98b52")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "3b9cb2d150821ae0aa6a4d69265dd5bb")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "") # Will load from env if set
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+14784006602")
 DEFAULT_ALERT_PHONE = os.getenv("ALERT_PHONE_NUMBER", "+919611751505")
 
@@ -92,21 +92,40 @@ def load_reposition(reposition_path, coords_df):
     if not reposition_path.exists(): return []
     df = pd.read_csv(reposition_path)
     df = _normalize_columns(df)
-    assigned_col = next((c for c in df.columns if c in ("assigned_zone", "assigned_h3", "h3_index")), None)
+    
+    # --- FIX: Standardize Column Names ---
+    # The CSV has 'estimated_profit' but the dashboard logic expects 'profit_est'
+    rename_map = {
+        "estimated_profit": "profit_est",
+        "repositioning_distance_km": "distance_km",
+        "assigned_zone": "assigned_zone",
+        "assigned_h3": "assigned_zone"
+    }
+    df = df.rename(columns=rename_map)
+    # -------------------------------------
+
+    assigned_col = next((c for c in df.columns if c in ("assigned_zone", "h3_index")), None)
     if not assigned_col: return []
         
+    # Merge with coordinates to get destination Lat/Lon
     merged = pd.merge(df, coords_df, left_on=assigned_col, right_on="h3_index", how="left")
     merged = merged.rename(columns={"lat": "to_lat", "lon": "to_lon"})
+    
+    # Drop rows where we couldn't find coordinates for the target zone
     merged = merged.dropna(subset=["to_lat", "to_lon"])
     
+    # Simulate driver starting positions if not provided
     if "from_lat" not in merged.columns:
         if not coords_df.empty and len(merged) <= len(coords_df):
+            # Pick random start points from existing zones for realism
             rnd = coords_df.sample(n=len(merged), replace=True).reset_index(drop=True)
             merged["from_lat"] = rnd["lat"].values
             merged["from_lon"] = rnd["lon"].values
         else:
+            # Fallback: Start slightly offset from destination
             merged["from_lat"] = merged["to_lat"] + 0.01
             merged["from_lon"] = merged["to_lon"] + 0.01
+            
     return merged.to_dict(orient="records")
 
 def load_alerts_for_map(alerts_path, coords_df):
@@ -146,23 +165,25 @@ alerts_map_df = load_alerts_for_map(ALERTS_CSV, coords_df)
 
 # Time Logic
 if forecast_df_raw.empty:
-    st.error("No forecast data available.")
+    st.error("No forecast data available. Run the pipeline first.")
     st.stop()
 
 unique_times = sorted(pd.to_datetime(forecast_df_raw["timestamp"].dropna().unique()))
-time_strings = [t.strftime("%H:%M:%S") for t in unique_times]
-
-# FIX FOR RANGE ERROR: Only show slider if >1 option
-if len(time_strings) > 1:
-    selected_idx = st.sidebar.select_slider("Forecast Window", options=range(len(time_strings)), format_func=lambda x: time_strings[x])
-    selected_ts = unique_times[selected_idx]
+if len(unique_times) > 0:
+    time_strings = [t.strftime("%H:%M:%S") for t in unique_times]
+    # FIX FOR RANGE ERROR: Only show slider if >1 option
+    if len(time_strings) > 1:
+        selected_idx = st.sidebar.select_slider("Forecast Window", options=range(len(time_strings)), format_func=lambda x: time_strings[x])
+        selected_ts = unique_times[selected_idx]
+    else:
+        selected_ts = unique_times[0]
+        st.sidebar.info(f"Live Forecast: {time_strings[0]}")
+    
+    st.sidebar.caption(f"Date: {selected_ts.strftime('%Y-%m-%d')}")
+    selected_df = merge_forecast_with_coords(forecast_df_raw, coords_df, selected_ts)
 else:
-    selected_ts = unique_times[0]
-    st.sidebar.info(f"Live Forecast: {time_strings[0]}")
-
-st.sidebar.caption(f"Date: {selected_ts.strftime('%Y-%m-%d')}")
-
-selected_df = merge_forecast_with_coords(forecast_df_raw, coords_df, selected_ts)
+    st.error("Forecast data is invalid (no timestamps).")
+    st.stop()
 
 # --- 5. MAP VISUALIZATION ---
 layers = []
@@ -209,6 +230,7 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("🚀 Fleet Operations Center")
     
+    # Check using the NEW standardized column names
     if not reposition_df.empty and "profit_est" in reposition_df.columns:
         # 1. KPI Metrics from Repositioning Plan
         total_drivers = len(reposition_df)
