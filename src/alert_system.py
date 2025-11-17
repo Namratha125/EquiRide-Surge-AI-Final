@@ -1,5 +1,5 @@
 """
-EquiRide Surge AI - Forecast-Based Alert System (Standalone + Compatible)
+EquiRide Surge AI - Forecast-Based Alert System (Multi-Recipient Support)
 Reads ONLY datasets/forecast_15min_predictions.csv for surge alerts.
 """
 
@@ -36,19 +36,20 @@ class AlertSystem:
             self.logger.info("Twilio alerts disabled in config")
 
     def _initialize_twilio(self):
-        """Initialize Twilio client with Multiple Recipients"""
+        """Initialize Twilio client for multiple recipients"""
         try:
             from twilio.rest import Client
             account_sid = os.getenv('TWILIO_ACCOUNT_SID')
             auth_token = os.getenv('TWILIO_AUTH_TOKEN')
             self.twilio_phone = os.getenv('TWILIO_PHONE_NUMBER')
             
-            # --- UPDATE: Load multiple comma-separated numbers ---
-            phones_str = os.getenv('ALERT_PHONE_NUMBER', "")
-            self.alert_phones = [p.strip() for p in phones_str.split(',') if p.strip()]
+            # --- MULTI-RECIPIENT LOGIC ---
+            # Read the string, split by comma, and strip whitespace
+            phones_env = os.getenv('ALERT_PHONE_NUMBER', "")
+            self.alert_phones = [p.strip() for p in phones_env.split(',') if p.strip()]
 
             if not all([account_sid, auth_token, self.twilio_phone, self.alert_phones]):
-                self.logger.warning("Twilio credentials invalid or no numbers found. SMS disabled.")
+                self.logger.warning("Twilio credentials incomplete or no alert numbers found. SMS disabled.")
                 self.twilio_enabled = False
                 return
 
@@ -82,9 +83,9 @@ class AlertSystem:
             self.logger.info(f"Cooldown active for {area_name}. Skipping SMS.")
             return False
 
-        sent_count = 0
+        success_count = 0
         try:
-            # --- UPDATE: Loop through all numbers ---
+            # Loop through every number in the list
             for phone in self.alert_phones:
                 try:
                     msg = self.twilio_client.messages.create(
@@ -92,13 +93,13 @@ class AlertSystem:
                         from_=self.twilio_phone,
                         to=phone
                     )
-                    sent_count += 1
-                except Exception as inner_e:
-                    self.logger.error(f"Failed sending to {phone}: {inner_e}")
+                    success_count += 1
+                except Exception as e:
+                    self.logger.error(f"Failed sending to {phone}: {str(e)}")
 
-            if sent_count > 0:
+            if success_count > 0:
                 self.last_alert_time[area_name] = datetime.now()
-                self.logger.info(f"SUCCESS SMS sent to {sent_count} recipients. SID: {msg.sid}")
+                self.logger.info(f"SUCCESS SMS sent to {success_count}/{len(self.alert_phones)} recipients.")
                 return True
             return False
 
@@ -112,38 +113,45 @@ class AlertSystem:
     def load_forecast_data(self, csv_path="datasets/forecast_15min_predictions.csv"):
         try:
             df = pd.read_csv(csv_path)
-
+            # Normalize columns just in case
+            df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+            
+            # Check for normalized names
             required = ["h3_index", "next_time", "pred_bookings_15min"]
             if not all(col in df.columns for col in required):
-                raise ValueError("CSV must contain: h3_index, next_time, pred_bookings_15min")
-
+                # Fallback check for old names
+                rename_map = {'h3': 'h3_index', 'pred_bookings': 'pred_bookings_15min'}
+                df = df.rename(columns=rename_map)
+                
             return df
-
         except Exception as e:
             self.logger.error(f"FAILED to load forecast CSV: {str(e)}")
             return pd.DataFrame()
 
     # ===================================================================
-    # FORECAST-BASED SURGE DETECTION
+    # FORECAST-BASED SURGE DETECTION (TOP 5 DEMO LOGIC)
     # ===================================================================
     def calculate_forecast_surges(self, df):
         try:
             log_stage(self.logger, "CHECK_FORECAST_SURGE", "START")
-
-            # --- UPDATE: Use Top 5 Logic for Reliable Demos ---
-            # Using standard deviation often fails for small datasets (0 alerts).
-            # This ensures the highest demand zones are ALWAYS flagged.
+            
+            # Sort by demand to find the biggest hotspots
+            if "pred_bookings_15min" not in df.columns:
+                return []
+                
             surge_rows = df.sort_values(by="pred_bookings_15min", ascending=False).head(5)
             
-            # Filter out very low values (e.g. zeros)
-            surge_rows = surge_rows[surge_rows["pred_bookings_15min"] > 10]
+            # Basic filter to avoid alerting on 0 demand
+            surge_rows = surge_rows[surge_rows["pred_bookings_15min"] > 20]
 
             alerts = []
+            max_val = surge_rows["pred_bookings_15min"].max() if not surge_rows.empty else 100
+
             for _, row in surge_rows.iterrows():
                 alerts.append({
                     "h3_index": row["h3_index"],
-                    "area_name": row["h3_index"],
-                    "severity": "CRITICAL" if row["pred_bookings_15min"] == surge_rows["pred_bookings_15min"].max() else "HIGH",
+                    "area_name": row.get("h3_index", "Unknown Zone"),
+                    "severity": "CRITICAL" if row["pred_bookings_15min"] >= max_val * 0.9 else "HIGH",
                     "pred_bookings": row["pred_bookings_15min"],
                     "next_time": row["next_time"],
                     "timestamp": datetime.now().isoformat()
@@ -161,14 +169,14 @@ class AlertSystem:
     # ===================================================================
     def format_forecast_alert_message(self, alert):
         msg = f"""
-PREDICTED SURGE ALERT
+🚨 EQUI-RIDE SURGE ALERT 🚨
 
-H3 Zone: {alert['h3_index']}
-Severity: {alert['severity']}
-Predicted Bookings (next 15 min): {alert['pred_bookings']:.1f}
-Forecast Time: {alert['next_time']}
+📍 Zone: {alert['h3_index']}
+⚠️ Level: {alert['severity']}
+📈 Demand: {alert['pred_bookings']:.0f} bookings
+⏰ Time: {alert['next_time']}
 
-Action: Deploy more drivers.
+Dispatch Action Required immediately.
 """
         return msg.strip()
 
@@ -192,6 +200,7 @@ Action: Deploy more drivers.
             sent = 0
             for alert in alerts:
                 msg = self.format_forecast_alert_message(alert)
+                # This returns True if at least one SMS was sent successfully
                 if self.send_sms_alert(msg, alert["h3_index"]):
                     sent += 1
 
